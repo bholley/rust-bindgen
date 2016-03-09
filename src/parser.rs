@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::path::Path;
+use std::mem;
 
 use syntax::abi;
 
@@ -16,6 +17,7 @@ use clangll::*;
 
 use super::Logger;
 
+#[derive(Clone)]
 pub struct ClangParserOptions {
     pub builtin_names: HashSet<String>,
     pub builtins: bool,
@@ -23,6 +25,7 @@ pub struct ClangParserOptions {
     pub emit_ast: bool,
     pub fail_on_unknown_type: bool,
     pub ignore_functions: bool,
+    pub enable_cxx_namespaces: bool,
     pub override_enum_ty: Option<il::IKind>,
     pub clang_args: Vec<String>,
 }
@@ -33,7 +36,9 @@ struct ClangParserCtx<'a> {
     globals: Vec<Global>,
     builtin_defs: Vec<Cursor>,
     logger: &'a (Logger+'a),
-    err_count: i32
+    err_count: i32,
+    anonymous_namespaces_found: usize,
+    namespaces: HashMap<String, ClangParserCtx<'a>>,
 }
 
 fn match_pattern(ctx: &mut ClangParserCtx, cursor: &Cursor) -> bool {
@@ -48,15 +53,7 @@ fn match_pattern(ctx: &mut ClangParserCtx, cursor: &Cursor) -> bool {
     }
 
     let name = file.name();
-    let mut found = false;
-    ctx.options.match_pat.iter().all(|pat| {
-        if (&name).contains(pat) {
-            found = true;
-        }
-        true
-    });
-
-    return found;
+    ctx.options.match_pat.iter().any(|pat| name.contains(pat))
 }
 
 fn decl_name(ctx: &mut ClangParserCtx, cursor: &Cursor) -> Global {
@@ -735,7 +732,7 @@ fn visit_literal(cursor: &Cursor, unit: &TranslationUnit) -> Option<i64> {
 }
 
 fn visit_top<'r>(cursor: &Cursor,
-                 ctx: &mut ClangParserCtx,
+                 mut ctx: &mut ClangParserCtx,
                  unit: &TranslationUnit) -> Enum_CXVisitorResult {
     if !match_pattern(ctx, cursor) {
         return CXChildVisit_Continue;
@@ -853,7 +850,43 @@ fn visit_top<'r>(cursor: &Cursor,
             return CXChildVisit_Continue;
         }
         CXCursor_Namespace => {
-            return CXChildVisit_Recurse;
+            if !ctx.options.enable_cxx_namespaces {
+                return CXChildVisit_Recurse;
+            }
+
+            let namespace_name = match unit.tokens(cursor) {
+                None => None,
+                Some(tokens) => {
+                    if tokens.len() <= 1 {
+                        None
+                    } else {
+                        match &*tokens[1].spelling {
+                            "{" => None,
+                            s => Some(s.to_owned()),
+                        }
+                    }
+                }
+            }.unwrap_or_else(|| {
+                ctx.anonymous_namespaces_found += 1;
+                format!("__anonymous{}", ctx.anonymous_namespaces_found)
+            });
+
+            let mut ns_ctx = ctx.namespaces.entry(namespace_name).or_insert(
+                ClangParserCtx {
+                    options: ctx.options.clone(),
+                    name: HashMap::new(),
+                    builtin_defs: vec!(),
+                    globals: vec!(),
+                    logger: ctx.logger,
+                    err_count: 0,
+                    anonymous_namespaces_found: 0,
+                    namespaces: HashMap::new(),
+                }
+            );
+
+            cursor.visit(|cur, _: &Cursor| visit_top(cur, &mut ns_ctx, &unit));
+
+            return CXChildVisit_Continue;
         }
         CXCursor_MacroDefinition => {
             let val = parse_int_literal_tokens(cursor, unit, 1);
@@ -889,14 +922,16 @@ fn log_err_warn(ctx: &mut ClangParserCtx, msg: &str, is_err: bool) {
     }
 }
 
-pub fn parse(options: ClangParserOptions, logger: &Logger) -> Result<Vec<Global>, ()> {
+pub fn parse(options: ClangParserOptions, logger: &Logger) -> Result<Module, ()> {
     let mut ctx = ClangParserCtx {
         options: options,
         name: HashMap::new(),
         builtin_defs: vec!(),
         globals: vec!(),
         logger: logger,
-        err_count: 0
+        err_count: 0,
+        anonymous_namespaces_found: 0,
+        namespaces: HashMap::new(),
     };
 
     let ix = cx::Index::create(false, true);
@@ -942,5 +977,19 @@ pub fn parse(options: ClangParserOptions, logger: &Logger) -> Result<Vec<Global>
         return Err(())
     }
 
-    Ok(ctx.globals)
+    let mut root = Module::new();
+
+    fn add_submodules<'a>(module: &mut Module,
+                          mut ctx: ClangParserCtx<'a>) {
+        mem::replace(module.globals(), ctx.globals);
+        for (name, ns) in ctx.namespaces.drain() {
+            let mut new = Module::new();
+            add_submodules(&mut new, ns);
+            module.add_submodule(name, new);
+        }
+    }
+
+    add_submodules(&mut root, ctx);
+
+    Ok(root)
 }

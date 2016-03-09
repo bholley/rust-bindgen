@@ -20,7 +20,7 @@ use syntax::print::pprust;
 use syntax::print::pp::eof;
 use syntax::ptr::P;
 
-use types::Global;
+use types::Module;
 
 mod types;
 mod clangll;
@@ -106,6 +106,7 @@ pub struct BindgenOptions {
     pub emit_ast: bool,
     pub ignore_functions: bool,
     pub fail_on_unknown_type: bool,
+    pub enable_cxx_namespaces: bool,
     pub override_enum_ty: String,
     pub clang_args: Vec<String>,
 }
@@ -119,6 +120,7 @@ impl Default for BindgenOptions {
             emit_ast: false,
             ignore_functions: false,
             fail_on_unknown_type: true,
+            enable_cxx_namespaces: false,
             override_enum_ty: "".to_string(),
             clang_args: Vec::new()
         }
@@ -146,21 +148,15 @@ impl Bindings {
     /// Deprecated - use a `Builder` instead
     pub fn generate(options: &BindgenOptions, logger: Option<&Logger>, span: Option<Span>) -> Result<Bindings, ()> {
         let l = DummyLogger;
-        let logger = match logger {
-            Some(l) => l,
-            None => &l as &Logger
-        };
+        let logger = logger.unwrap_or(&l as &Logger);
 
-        let span = match span {
-            Some(s) => s,
-            None => DUMMY_SP
-        };
+        let span = span.unwrap_or(DUMMY_SP);
 
-        let globals = try!(parse_headers(options, logger));
+        let root_module = try!(parse_headers(options, logger));
 
         let module = ast::Mod {
             inner: span,
-            items: gen::gen_mod(&options.links[..], globals, span)
+            items: gen::gen_mods(&options.links[..], root_module, span)
         };
 
         Ok(Bindings {
@@ -204,7 +200,7 @@ impl Logger for DummyLogger {
     fn warn(&self, _msg: &str) { }
 }
 
-fn parse_headers(options: &BindgenOptions, logger: &Logger) -> Result<Vec<Global>, ()> {
+fn parse_headers(options: &BindgenOptions, logger: &Logger) -> Result<Module, ()> {
     fn str_to_ikind(s: &str) -> Option<types::IKind> {
         match s {
             "uchar"     => Some(types::IUChar),
@@ -228,6 +224,7 @@ fn parse_headers(options: &BindgenOptions, logger: &Logger) -> Result<Vec<Global
         emit_ast: options.emit_ast,
         ignore_functions: options.ignore_functions,
         fail_on_unknown_type: options.fail_on_unknown_type,
+        enable_cxx_namespaces: options.enable_cxx_namespaces,
         override_enum_ty: str_to_ikind(&options.override_enum_ty),
         clang_args: options.clang_args.clone(),
     };
