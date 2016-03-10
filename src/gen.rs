@@ -22,7 +22,34 @@ use types::*;
 
 struct GenCtx<'r> {
     ext_cx: base::ExtCtxt<'r>,
-    span: Span
+    span: Span,
+    module_map: ModuleMap,
+    enable_cxx_namespaces: bool,
+    current_module_id: ModuleId,
+}
+
+impl<'r> GenCtx<'r> {
+    fn full_path_for_module(&self, id: ModuleId) -> Vec<String> {
+        if !self.enable_cxx_namespaces {
+            return vec![];
+        }
+
+        let mut ret = vec![];
+
+        let mut current_id = Some(id);
+        while let Some(current) = current_id {
+            let module = &self.module_map.get(&current).unwrap();
+            ret.push(module.name.clone());
+            current_id = module.parent_id;
+        }
+
+        if self.current_module_id == ROOT_MODULE_ID {
+            ret.pop(); // The root module doens'n need a root:: in the pattern
+        }
+
+        ret.reverse();
+        ret
+    }
 }
 
 fn first<A, B>((val, _): (A, B)) -> A {
@@ -44,57 +71,48 @@ fn empty_generics() -> ast::Generics {
     }
 }
 
-fn rust_id(ctx: &mut GenCtx, name: String) -> (String, bool) {
-    let token = parse::token::Ident(ctx.ext_cx.ident_of(&name), parse::token::Plain);
-    if token.is_any_keyword() || "bool" == &name {
+fn rust_id(ctx: &mut GenCtx, name: &str) -> (String, bool) {
+    let token = parse::token::Ident(ctx.ext_cx.ident_of(name), parse::token::Plain);
+    if token.is_any_keyword() || "bool" == name {
         let mut s = "_".to_string();
-        s.push_str(&name);
+        s.push_str(name);
         (s, true)
     } else {
-        (name, false)
+        (name.to_owned(), false)
     }
 }
 
-fn rust_type_id(ctx: &mut GenCtx, name: String) -> String {
-    if "bool" == name ||
-        "uint" == name ||
-        "u8" == name ||
-        "u16" == name ||
-        "u32" == name ||
-        "f32" == name ||
-        "f64" == name ||
-        "i8" == name ||
-        "i16" == name ||
-        "i32" == name ||
-        "i64" == name ||
-        "Self" == name ||
-        "str" == name {
-        let mut s = "_".to_string();
-        s.push_str(&name);
-        s
-    } else {
-        let (n, _) = rust_id(ctx, name);
-        n
+fn rust_type_id(ctx: &mut GenCtx, name: &str) -> String {
+    match name {
+        "bool" | "uint" | "u8" | "u16" |
+        "u32" | "f32" | "f64" | "i8" |
+        "i16" | "i32" | "i64" | "Self" |
+        "str" => {
+            let mut s = "_".to_string();
+            s.push_str(name);
+            s
+        }
+        _ => first(rust_id(ctx, name))
     }
 }
 
-fn comp_name(kind: CompKind, name: &String) -> String {
+fn comp_name(kind: CompKind, name: &str) -> String {
     match kind {
         CompKind::Struct => struct_name(name),
         CompKind::Union  => union_name(name),
     }
 }
 
-fn struct_name(name: &String) -> String {
-    format!("{}", name)
+fn struct_name(name: &str) -> String {
+    name.to_owned()
 }
 
-fn union_name(name: &String) -> String {
-    format!("{}", name)
+fn union_name(name: &str) -> String {
+    name.to_owned()
 }
 
-fn enum_name(name: &String) -> String {
-    format!("{}", name)
+fn enum_name(name: &str) -> String {
+    name.to_owned()
 }
 
 fn gen_unmangle_method(ctx: &mut GenCtx,
@@ -134,7 +152,7 @@ fn gen_unmangle_method(ctx: &mut GenCtx,
                     unnamed += 1;
                     format!("arg{}", unnamed)
                 } else {
-                    rust_id(ctx, n.clone()).0
+                    first(rust_id(ctx, &n))
                 };
                 let expr = ast::Expr {
                     id: ast::DUMMY_NODE_ID,
@@ -204,7 +222,7 @@ fn gen_unmangle_method(ctx: &mut GenCtx,
     count += 1;
     counts.insert(v.name.clone(), count);
 
-    let mut attrs = mk_doc_attr(ctx, v.comment.clone());
+    let mut attrs = mk_doc_attr(ctx, &v.comment);
     attrs.push(respan(ctx.span, ast::Attribute_ {
         id: mk_attr_id(),
         style: ast::AttrStyle::Outer,
@@ -224,12 +242,15 @@ fn gen_unmangle_method(ctx: &mut GenCtx,
     P(item)
 }
 
-pub fn gen_mods(links: &[(String, LinkType)], mut root_module: Module, span: Span) -> Vec<P<ast::Item>> {
+pub fn gen_mods(links: &[(String, LinkType)],
+                map: ModuleMap,
+                enable_namespaces: bool,
+                span: Span) -> Vec<P<ast::Item>> {
     // Create a dummy ExtCtxt. We only need this for string interning and that uses TLS.
     let mut features = Features::new();
     features.allow_quote = true;
     let cfg = ExpansionConfig {
-        crate_name: "xxx".to_string(),
+        crate_name: "xxx".to_owned(),
         features: Some(&features),
         recursion_limit: 64,
         trace_mac: false,
@@ -238,8 +259,12 @@ pub fn gen_mods(links: &[(String, LinkType)], mut root_module: Module, span: Spa
     let mut feature_gated_cfgs = vec![];
     let mut ctx = GenCtx {
         ext_cx: base::ExtCtxt::new(sess, Vec::new(), cfg, &mut feature_gated_cfgs),
-        span: span
+        span: span,
+        module_map: map,
+        enable_cxx_namespaces: enable_namespaces,
+        current_module_id: ROOT_MODULE_ID,
     };
+
     ctx.ext_cx.bt_push(ExpnInfo {
         call_site: ctx.span,
         callee: NameAndSpan {
@@ -249,38 +274,106 @@ pub fn gen_mods(links: &[(String, LinkType)], mut root_module: Module, span: Spa
         }
     });
 
-    gen_mod(&mut ctx, &mut root_module, links, span).items
+    if let Some(root_mod) = gen_mod(&mut ctx, ROOT_MODULE_ID, links, span) {
+        if !ctx.enable_cxx_namespaces {
+            match root_mod.node {
+                // XXX This clone might be really expensive, but doing:
+                // ast::ItemMod(ref mut root) => {
+                //     return ::std::mem::replace(&mut root.items, vec![]);
+                // }
+                // fails with "error: cannot borrow immutable anonymous field as mutable".
+                // So...
+                ast::ItemMod(ref root) => {
+                    return root.items.clone()
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let root_export = P(ast::Item {
+            ident: ctx.ext_cx.ident_of(""),
+            attrs: vec![],
+            id: ast::DUMMY_NODE_ID,
+            node: ast::ItemUse(P(
+                Spanned {
+                    node: ast::ViewPathGlob(ast::Path {
+                        span: span.clone(),
+                        global: false,
+                        segments: vec![ast::PathSegment {
+                            identifier: root_mod.ident,
+                            parameters: ast::PathParameters::none(),
+                        }]
+                    }),
+                    span: span.clone(),
+                })),
+            vis: ast::Public,
+            span: span.clone(),
+        });
+
+        vec![root_export, root_mod]
+    } else {
+        vec![]
+    }
 }
 
 fn gen_mod(mut ctx: &mut GenCtx,
-           mut module: &mut Module,
+           module_id: ModuleId,
            links: &[(String, LinkType)],
-           span: Span) -> ast::Mod {
+           span: Span) -> Option<P<ast::Item>> {
 
-    let mut globals = gen_globals(&mut ctx, links, module.globals());
-    globals.extend(module.submodules().drain().filter_map(|(name, mut module)| {
-        let module = gen_mod(ctx, &mut module, links, span.clone());
+    // XXX avoid this clone
+    let module = ctx.module_map.get(&module_id).unwrap().clone();
 
-        // mod foo; represents a module in another file, not an empty module,
-        // so...
-        if !module.items.is_empty() {
-            Some(P(ast::Item {
-                ident: ctx.ext_cx.ident_of(&name),
-                attrs: vec![],
-                id: ast::DUMMY_NODE_ID,
-                node: ast::ItemMod(module),
-                vis: ast::Public,
-                span: span.clone(),
-            }))
-        } else {
-            None
-        }
+    // Import just the root to minimise name conflicts
+    let mut globals = if module_id != ROOT_MODULE_ID {
+        // XXX Pass this previously instead of looking it up always?
+        let root = ctx.ext_cx.ident_of(&ctx.module_map.get(&ROOT_MODULE_ID).unwrap().name);
+        vec![P(ast::Item {
+            ident: ctx.ext_cx.ident_of(""),
+            attrs: vec![],
+            id: ast::DUMMY_NODE_ID,
+            node: ast::ItemUse(P(
+                Spanned {
+                    node: ast::ViewPathSimple(root.clone(),
+                              ast::Path {
+                                  span: span.clone(),
+                                  global: false,
+                                  segments: vec![ast::PathSegment {
+                                      identifier: root,
+                                      parameters: ast::PathParameters::none(),
+                                  }]
+                              }),
+                    span: span.clone(),
+                })),
+            vis: ast::Public,
+            span: span.clone(),
+        })]
+    } else {
+        vec![]
+    };
+
+    ctx.current_module_id = module_id;
+
+    globals.extend(gen_globals(&mut ctx, links, &module.globals).into_iter());
+
+    globals.extend(module.children_ids.iter().filter_map(|id| {
+        gen_mod(ctx, *id, links, span.clone())
     }));
 
-
-    ast::Mod {
-        inner: span,
-        items: globals,
+    if !globals.is_empty() {
+        Some(P(ast::Item {
+            ident: ctx.ext_cx.ident_of(&module.name),
+            attrs: vec![],
+            id: ast::DUMMY_NODE_ID,
+            node: ast::ItemMod(ast::Mod {
+                inner: span,
+                items: globals,
+            }),
+            vis: ast::Public,
+            span: span.clone(),
+        }))
+    } else {
+        None
     }
 }
 
@@ -325,7 +418,7 @@ fn gen_globals(mut ctx: &mut GenCtx,
         match g {
             GType(ti) => {
                 let t = ti.borrow().clone();
-                defs.extend(ctypedef_to_rs(&mut ctx, t.name.clone(), t.comment.clone(), &t.ty).into_iter())
+                defs.extend(ctypedef_to_rs(&mut ctx, t).into_iter())
             },
             GCompDecl(ci) => {
                 let c = ci.borrow().clone();
@@ -346,7 +439,7 @@ fn gen_globals(mut ctx: &mut GenCtx,
             },
             GVar(vi) => {
                 let v = vi.borrow();
-                let ty = cty_to_rs(&mut ctx, &v.ty, v.is_const);
+                let ty = cty_to_rs(&mut ctx, &v.ty, v.is_const, true);
                 defs.push(const_to_rs(&mut ctx, v.name.clone(), v.val.unwrap(), ty));
             },
             _ => { }
@@ -453,14 +546,14 @@ fn mk_extern(ctx: &mut GenCtx, links: &[(String, LinkType)],
         items: items
     });
 
-    return P(ast::Item {
-              ident: ctx.ext_cx.ident_of(""),
-              attrs: attrs,
-              id: ast::DUMMY_NODE_ID,
-              node: ext,
-              vis: ast::Inherited,
-              span: ctx.span
-           });
+    P(ast::Item {
+        ident: ctx.ext_cx.ident_of(""),
+        attrs: attrs,
+        id: ast::DUMMY_NODE_ID,
+        node: ext,
+        vis: ast::Inherited,
+        span: ctx.span
+    })
 }
 
 fn mk_impl(ctx: &mut GenCtx, ty: P<ast::Ty>,
@@ -511,9 +604,9 @@ fn remove_redundant_decl(gs: Vec<Global>) -> Vec<Global> {
         }
     ).collect();
 
-    return gs.into_iter().filter(|g|
+    gs.into_iter().filter(|g|
         !typedefs.iter().any(|t| check_decl(g, t))
-    ).collect();
+    ).collect()
 }
 
 fn tag_dup_decl(gs: &[Global]) -> Vec<Global> {
@@ -631,13 +724,13 @@ fn tag_dup_decl(gs: &[Global]) -> Vec<Global> {
     return res;
 }
 
-fn ctypedef_to_rs(ctx: &mut GenCtx, name: String, comment: String, ty: &Type) -> Vec<P<ast::Item>> {
-    fn mk_item(ctx: &mut GenCtx, name: String, comment: String, ty: &Type) -> P<ast::Item> {
+fn ctypedef_to_rs(ctx: &mut GenCtx, ty: TypeInfo) -> Vec<P<ast::Item>> {
+    fn mk_item(ctx: &mut GenCtx, name: &str, comment: &str, ty: &Type) -> P<ast::Item> {
         let rust_name = rust_type_id(ctx, name);
         let rust_ty = if cty_is_translatable(ty) {
-            cty_to_rs(ctx, ty, true)
+            cty_to_rs(ctx, ty, true, true)
         } else {
-            cty_to_rs(ctx, &TVoid, true)
+            cty_to_rs(ctx, &TVoid, true, true)
         };
         let base = ast::ItemTy(
             P(ast::Ty {
@@ -648,26 +741,26 @@ fn ctypedef_to_rs(ctx: &mut GenCtx, name: String, comment: String, ty: &Type) ->
             empty_generics()
         );
 
-        return P(ast::Item {
-                  ident: ctx.ext_cx.ident_of(&rust_name),
-                  attrs: mk_doc_attr(ctx, comment),
-                  id: ast::DUMMY_NODE_ID,
-                  node: base,
-                  vis: ast::Public,
-                  span: ctx.span
-               });
+        P(ast::Item {
+            ident: ctx.ext_cx.ident_of(&rust_name),
+            attrs: mk_doc_attr(ctx, comment),
+            id: ast::DUMMY_NODE_ID,
+            node: base,
+            vis: ast::Public,
+            span: ctx.span
+        })
     }
 
-    return match *ty {
+    match ty.ty {
         TComp(ref ci) => {
             assert!(!ci.borrow().name.is_empty());
-            vec!(mk_item(ctx, name, comment, ty))
+            vec!(mk_item(ctx, &ty.name, &ty.comment, &ty.ty))
         },
         TEnum(ref ei) => {
             assert!(!ei.borrow().name.is_empty());
-            vec!(mk_item(ctx, name, comment, ty))
+            vec!(mk_item(ctx, &ty.name, &ty.comment, &ty.ty))
         },
-        _ => vec!(mk_item(ctx, name, comment, ty))
+        _ => vec!(mk_item(ctx, &ty.name, &ty.comment, &ty.ty)),
     }
 }
 
@@ -682,7 +775,7 @@ fn comp_to_rs(ctx: &mut GenCtx, name: String, ci: CompInfo)
 fn cstruct_to_rs(ctx: &mut GenCtx, name: String, ci: CompInfo) -> Vec<P<ast::Item>> {
     let layout = ci.layout;
     let members = &ci.members;
-    let args = &ci.args;
+    let template_args = &ci.args;
     let methodlist = &ci.methods;
     let mut fields = vec!();
     let mut methods = vec!();
@@ -694,12 +787,12 @@ fn cstruct_to_rs(ctx: &mut GenCtx, name: String, ci: CompInfo) -> Vec<P<ast::Ite
     let mut bitfields: u32 = 0;
 
     if ci.hide ||
-       args.iter().any(|f| match *f { TVoid => true, _ => false }) {
+       template_args.iter().any(|f| f == &TVoid) {
         return vec!();
     }
 
-    let id = rust_type_id(ctx, name.clone());
-    let id_ty = P(mk_ty(ctx, false, vec!(id.clone())));
+    let id = rust_type_id(ctx, &name);
+    let id_ty = P(mk_ty(ctx, false, &[id.clone()]));
 
     if ci.has_vtable {
         let mut vffields = vec!();
@@ -727,7 +820,7 @@ fn cstruct_to_rs(ctx: &mut GenCtx, name: String, ci: CompInfo) -> Vec<P<ast::Ite
             let field = ast::StructField_ {
                 kind: ast::NamedField(ctx.ext_cx.ident_of("_base"), ast::Public),
                 id: ast::DUMMY_NODE_ID,
-                ty: P(mk_ty_args(ctx, false, vec!(base.clone()), vec!())),
+                ty: P(mk_ty(ctx, false, &[base.clone()])),
                 attrs: vec!(),
             };
             vffields.push(respan(ctx.span, field));
@@ -764,8 +857,8 @@ fn cstruct_to_rs(ctx: &mut GenCtx, name: String, ci: CompInfo) -> Vec<P<ast::Ite
         };
         extra.push(P(item));
 
-        if base_vftable == None {
-            let vf_type = mk_ty_args(ctx, false, vec!(vf_name), vec!());
+        if base_vftable.is_none() {
+            let vf_type = mk_ty(ctx, false, &[vf_name]);
             fields.push(respan(ctx.span, ast::StructField_ {
                 kind: ast::NamedField(ctx.ext_cx.ident_of("_vftable"), ast::Public),
                 id: ast::DUMMY_NODE_ID,
@@ -777,10 +870,10 @@ fn cstruct_to_rs(ctx: &mut GenCtx, name: String, ci: CompInfo) -> Vec<P<ast::Ite
 
     if members.is_empty() {
         let mut phantom_count = 0;
-        for arg in args {
+        for arg in template_args {
             let f_name = format!("_phantom{}", phantom_count);
             phantom_count += 1;
-            let inner_type = P(cty_to_rs(ctx, &arg, true));
+            let inner_type = P(cty_to_rs(ctx, &arg, true, false));
             fields.push(respan(ctx.span, ast::StructField_ {
                 kind: ast::NamedField(
                     ctx.ext_cx.ident_of(&f_name),
@@ -841,7 +934,7 @@ fn cstruct_to_rs(ctx: &mut GenCtx, name: String, ci: CompInfo) -> Vec<P<ast::Ite
                     bitfields += 1;
                     format!("_bitfield_{}", bitfields)
                 }
-                None => rust_type_id(ctx, f.name.clone())
+                None => rust_type_id(ctx, &f.name)
             };
 
             let mut offset: u32 = 0;
@@ -868,7 +961,10 @@ fn cstruct_to_rs(ctx: &mut GenCtx, name: String, ci: CompInfo) -> Vec<P<ast::Ite
             } else {
                 f.ty.clone()
             };
-            let f_ty = P(cty_to_rs(ctx, &f_ty, f.bitfields == None));
+
+            // If the member is not a template argument, it needs the full path.
+            let needs_full_path = !template_args.iter().any(|arg| *arg == f_ty);
+            let f_ty = P(cty_to_rs(ctx, &f_ty, f.bitfields.is_none(), needs_full_path));
 
             fields.push(respan(ctx.span, ast::StructField_ {
                 kind: ast::NamedField(
@@ -877,7 +973,7 @@ fn cstruct_to_rs(ctx: &mut GenCtx, name: String, ci: CompInfo) -> Vec<P<ast::Ite
                 ),
                 id: ast::DUMMY_NODE_ID,
                 ty: f_ty,
-                attrs: mk_doc_attr(ctx, f.comment.clone())
+                attrs: mk_doc_attr(ctx, &f.comment)
             }));
             if bypass {
                 continue;
@@ -919,7 +1015,7 @@ fn cstruct_to_rs(ctx: &mut GenCtx, name: String, ci: CompInfo) -> Vec<P<ast::Ite
     } else {
         ast::VariantData::Struct(fields, ast::DUMMY_NODE_ID)
     };
-    let ty_params = args.iter().map(|gt| {
+    let ty_params = template_args.iter().map(|gt| {
         let name = match gt {
             &TNamed(ref ti) => {
                 ctx.ext_cx.ident_of(&ti.borrow().name)
@@ -947,7 +1043,7 @@ fn cstruct_to_rs(ctx: &mut GenCtx, name: String, ci: CompInfo) -> Vec<P<ast::Ite
         }
     );
 
-    let mut attrs = mk_doc_attr(ctx, ci.comment);
+    let mut attrs = mk_doc_attr(ctx, &ci.comment);
     attrs.push(mk_repr_attr(ctx, layout));
     if !has_destructor {
         attrs.push(mk_deriving_copy_attr(ctx));
@@ -1020,7 +1116,7 @@ fn opaque_to_rs(ctx: &mut GenCtx, name: String) -> P<ast::Item> {
         empty_generics()
     );
 
-    let id = rust_type_id(ctx, name);
+    let id = rust_type_id(ctx, &name);
     return P(ast::Item { ident: ctx.ext_cx.ident_of(&id),
               attrs: Vec::new(),
               id: ast::DUMMY_NODE_ID,
@@ -1033,18 +1129,19 @@ fn opaque_to_rs(ctx: &mut GenCtx, name: String) -> P<ast::Item> {
 fn cunion_to_rs(ctx: &mut GenCtx, name: String, layout: Layout, members: Vec<CompMember>) -> Vec<P<ast::Item>> {
     fn mk_item(ctx: &mut GenCtx, name: String, item: ast::Item_, vis:
                ast::Visibility, attrs: Vec<ast::Attribute>) -> P<ast::Item> {
-        return P(ast::Item {
+        P(ast::Item {
             ident: ctx.ext_cx.ident_of(&name),
             attrs: attrs,
             id: ast::DUMMY_NODE_ID,
             node: item,
             vis: vis,
             span: ctx.span
-        });
+        })
     }
 
-    let ci = Rc::new(RefCell::new(CompInfo::new(name.clone(), name.clone(), "".to_owned(), CompKind::Union, members.clone(), layout)));
-    let union = TNamed(Rc::new(RefCell::new(TypeInfo::new(name.clone(), TComp(ci), layout))));
+    // XXX what module id is correct?
+    let ci = Rc::new(RefCell::new(CompInfo::new(name.clone(), ROOT_MODULE_ID, name.clone(), "".to_owned(), CompKind::Union, members.clone(), layout)));
+    let union = TNamed(Rc::new(RefCell::new(TypeInfo::new(name.clone(), ROOT_MODULE_ID, TComp(ci), layout))));
 
     // Nested composites may need to emit declarations and implementations as
     // they are encountered.  The declarations end up in 'extra' and are emitted
@@ -1058,7 +1155,7 @@ fn cunion_to_rs(ctx: &mut GenCtx, name: String, layout: Layout, members: Vec<Com
         ast::VariantData::Struct(vec![data_field], ast::DUMMY_NODE_ID),
         empty_generics()
     );
-    let union_id = rust_type_id(ctx, name.clone());
+    let union_id = rust_type_id(ctx, &name);
     let union_attrs = vec!(mk_repr_attr(ctx, layout), mk_deriving_copy_attr(ctx));
     let union_def = mk_item(ctx, union_id, def, ast::Public, union_attrs);
 
@@ -1067,7 +1164,7 @@ fn cunion_to_rs(ctx: &mut GenCtx, name: String, layout: Layout, members: Vec<Com
         ast::ImplPolarity::Positive,
         empty_generics(),
         None,
-        P(cty_to_rs(ctx, &union, true)),
+        P(cty_to_rs(ctx, &union, true, true)),
         gen_comp_methods(ctx, data_field_name, 0, CompKind::Union, &members, &mut extra),
     );
 
@@ -1091,7 +1188,7 @@ fn const_to_rs(ctx: &mut GenCtx, name: String, val: i64, val_ty: ast::Ty) -> P<a
         ctx.ext_cx.expr_lit(ctx.span, int_lit)
             );
 
-    let id = first(rust_id(ctx, name.clone()));
+    let id = first(rust_id(ctx, &name));
     P(ast::Item {
         ident: ctx.ext_cx.ident_of(&id[..]),
         attrs: Vec::new(),
@@ -1124,7 +1221,7 @@ fn cenum_to_rs(ctx: &mut GenCtx, name: String, comment: String, items: Vec<EnumI
 
         let variant = respan(ctx.span, ast::Variant_ {
             name: ctx.ext_cx.ident_of(&it.name),
-            attrs: mk_doc_attr(ctx, it.comment.clone()),
+            attrs: mk_doc_attr(ctx, &it.comment),
             data: ast::VariantData::Unit(ast::DUMMY_NODE_ID),
             disr_expr: Some(P(ast::Expr {
                 id: ast::DUMMY_NODE_ID,
@@ -1144,7 +1241,7 @@ fn cenum_to_rs(ctx: &mut GenCtx, name: String, comment: String, items: Vec<EnumI
         _ => "i32",
     };
 
-    let mut attrs = mk_doc_attr(ctx, comment);
+    let mut attrs = mk_doc_attr(ctx, &comment);
     attrs.push(respan(ctx.span, ast::Attribute_ {
         id: mk_attr_id(),
         style: ast::AttrStyle::Outer,
@@ -1179,8 +1276,8 @@ fn gen_comp_methods(ctx: &mut GenCtx, data_field: &str, data_offset: usize,
         // TODO: Implement bitfield accessors
         if f.bitfields.is_some() { return None; }
 
-        let (f_name, _) = rust_id(ctx, f.name.clone());
-        let ret_ty = P(cty_to_rs(ctx, &TPtr(Box::new(f.ty.clone()), false, false, Layout::zero()), true));
+        let f_name = first(rust_id(ctx, &f.name));
+        let ret_ty = P(cty_to_rs(ctx, &TPtr(Box::new(f.ty.clone()), false, false, Layout::zero()), true, true));
 
         // When the offset is zero, generate slightly prettier code.
         let method = {
@@ -1248,14 +1345,14 @@ fn type_for_bitfield_width(ctx: &mut GenCtx, width: u32) -> ast::Ty {
     } else {
         "bool"
     };
-    mk_ty(ctx, false, vec!(input_type.to_string()))
+    mk_ty(ctx, false, &[input_type.to_owned()])
 }
 
 fn gen_bitfield_method(ctx: &mut GenCtx, bindgen_name: &String,
                        field_name: &String, field_type: &Type,
                        offset: usize, width: u32) -> ast::ImplItem {
     let input_type = type_for_bitfield_width(ctx, width);
-    let field_type = cty_to_rs(ctx, &field_type, false);
+    let field_type = cty_to_rs(ctx, &field_type, false, true);
     let setter_name = ctx.ext_cx.ident_of(&format!("set_{}", field_name));
     let bindgen_ident = ctx.ext_cx.ident_of(&*bindgen_name);
 
@@ -1275,7 +1372,7 @@ fn gen_bitfield_method(ctx: &mut GenCtx, bindgen_name: &String,
 
 fn gen_fullbitfield_method(ctx: &mut GenCtx, bindgen_name: &String,
                            field_type: &Type, bitfields: &[(String, u32)]) -> ast::ImplItem {
-    let field_type = cty_to_rs(ctx, field_type, false);
+    let field_type = cty_to_rs(ctx, field_type, false, true);
     let mut args = vec!();
     let mut unnamed: usize = 0;
     for &(ref name, width) in bitfields.iter() {
@@ -1365,7 +1462,7 @@ fn mk_blob_field(ctx: &GenCtx, name: &str, layout: Layout) -> Spanned<ast::Struc
     };
     let data_len = if ty_name == "u8" { layout.size } else { layout.size / layout.align };
 
-    let base_ty = mk_ty(ctx, false, vec!(ty_name.to_string()));
+    let base_ty = mk_ty(ctx, false, &[ty_name.to_owned()]);
     let data_ty = if data_len == 1 {
         P(base_ty)
     } else {
@@ -1429,14 +1526,14 @@ fn mk_deriving_copy_attr(ctx: &mut GenCtx) -> ast::Attribute {
     })
 }
 
-fn mk_doc_attr(ctx: &mut GenCtx, doc: String) -> Vec<ast::Attribute> {
+fn mk_doc_attr(ctx: &mut GenCtx, doc: &str) -> Vec<ast::Attribute> {
     if doc.is_empty() {
         return vec!();
     }
 
     let attr_val = P(respan(ctx.span, ast::MetaNameValue(
         InternedString::new("doc"),
-        respan(ctx.span, ast::LitStr(intern(&doc).as_str(), ast::CookedStr))
+        respan(ctx.span, ast::LitStr(intern(doc).as_str(), ast::CookedStr))
     )));
 
     vec!(respan(ctx.span, ast::Attribute_ {
@@ -1451,7 +1548,7 @@ fn cvar_to_rs(ctx: &mut GenCtx, name: String,
                                 mangled: String,
                                 ty: &Type,
                                 is_const: bool) -> P<ast::ForeignItem> {
-    let (rust_name, was_mangled) = rust_id(ctx, name.clone());
+    let (rust_name, was_mangled) = rust_id(ctx, &name);
 
     let mut attrs = Vec::new();
     if !mangled.is_empty() {
@@ -1460,7 +1557,7 @@ fn cvar_to_rs(ctx: &mut GenCtx, name: String,
         attrs.push(mk_link_name_attr(ctx, name));
     }
 
-    let val_ty = P(cty_to_rs(ctx, ty, true));
+    let val_ty = P(cty_to_rs(ctx, ty, true, true));
 
     return P(ast::ForeignItem {
         ident: ctx.ext_cx.ident_of(&rust_name),
@@ -1481,8 +1578,8 @@ fn cfuncty_to_rs(ctx: &mut GenCtx,
         TVoid => ast::DefaultReturn(ctx.span),
         // Disable references in returns for now
         TPtr(ref t, is_const, _, ref layout) =>
-            ast::Return(P(cty_to_rs(ctx, &TPtr(t.clone(), is_const, false, layout.clone()), true))),
-        _ => ast::Return(P(cty_to_rs(ctx, rty, true)))
+            ast::Return(P(cty_to_rs(ctx, &TPtr(t.clone(), is_const, false, layout.clone()), true, true))),
+        _ => ast::Return(P(cty_to_rs(ctx, rty, true, true)))
     };
 
     let mut unnamed: usize = 0;
@@ -1493,7 +1590,7 @@ fn cfuncty_to_rs(ctx: &mut GenCtx,
             unnamed += 1;
             format!("arg{}", unnamed)
         } else {
-            first(rust_id(ctx, n.clone()))
+            first(rust_id(ctx, &n))
         };
 
         // From the C90 standard (http://c0x.coding-guidelines.com/6.7.5.3.html)
@@ -1502,8 +1599,8 @@ fn cfuncty_to_rs(ctx: &mut GenCtx,
         // (if any) are those specified within the [ and ] of the array type
         // derivation.
         let arg_ty = P(match t {
-            &TArray(ref typ, _, ref l) => cty_to_rs(ctx, &TPtr(typ.clone(), false, false, l.clone()), true),
-            _ => cty_to_rs(ctx, t, true),
+            &TArray(ref typ, _, ref l) => cty_to_rs(ctx, &TPtr(typ.clone(), false, false, l.clone()), true, true),
+            _ => cty_to_rs(ctx, t, true, true),
         });
 
         ast::Arg {
@@ -1543,9 +1640,9 @@ fn cfunc_to_rs(ctx: &mut GenCtx,
         empty_generics()
     );
 
-    let (rust_name, was_mangled) = rust_id(ctx, name.clone());
+    let (rust_name, was_mangled) = rust_id(ctx, &name);
 
-    let mut attrs = mk_doc_attr(ctx, comment);
+    let mut attrs = mk_doc_attr(ctx, &comment);
     if !mangled.is_empty() {
         attrs.push(mk_link_name_attr(ctx, mangled));
     } else if was_mangled {
@@ -1562,9 +1659,9 @@ fn cfunc_to_rs(ctx: &mut GenCtx,
            });
 }
 
-fn cty_to_rs(ctx: &mut GenCtx, ty: &Type, allow_bool: bool) -> ast::Ty {
-    return match ty {
-        &TVoid => mk_ty(ctx, true, vec!("libc".to_string(), "c_void".to_string())),
+fn cty_to_rs(ctx: &mut GenCtx, ty: &Type, allow_bool: bool, use_full_path: bool) -> ast::Ty {
+    match ty {
+        &TVoid => mk_ty(ctx, true, &["libc".to_owned(), "c_void".to_owned()]),
         &TInt(i, ref layout) => match i {
             IBool => {
                 let ty_name = match layout.size {
@@ -1574,25 +1671,25 @@ fn cty_to_rs(ctx: &mut GenCtx, ty: &Type, allow_bool: bool) -> ast::Ty {
                     8 => "u64",
                     _ => "u8",
                 };
-                mk_ty(ctx, false, vec!(ty_name.to_string()))
+                mk_ty(ctx, false, &[ty_name.to_owned()])
             },
-            ISChar => mk_ty(ctx, true, vec!("libc".to_string(), "c_char".to_string())),
+            ISChar => mk_ty(ctx, true, &["libc".to_owned(), "c_char".to_owned()]),
             IInt |
             IShort |
-            ILongLong => mk_ty(ctx, false, vec!(format!("i{}", layout.size * 8))),
+            ILongLong => mk_ty(ctx, false, &[format!("i{}", layout.size * 8)]),
             IUChar |
             IUInt |
             IUShort |
-            IULongLong => mk_ty(ctx, false, vec!(format!("u{}", layout.size * 8))),
-            ILong => mk_ty(ctx, true, vec!("libc".to_string(), "c_long".to_string())),
-            IULong => mk_ty(ctx, true, vec!("libc".to_string(), "c_ulong".to_string())),
+            IULongLong => mk_ty(ctx, false, &[format!("u{}", layout.size * 8)]),
+            ILong => mk_ty(ctx, true, &["libc".to_owned(), "c_long".to_owned()]),
+            IULong => mk_ty(ctx, true, &["libc".to_owned(), "c_ulong".to_owned()]),
         },
         &TFloat(f, _) => match f {
-            FFloat => mk_ty(ctx, false, vec!("f32".to_string())),
-            FDouble => mk_ty(ctx, false, vec!("f64".to_string()))
+            FFloat => mk_ty(ctx, false, &["f32".to_owned()]),
+            FDouble => mk_ty(ctx, false, &["f64".to_owned()])
         },
         &TPtr(ref t, is_const, _is_ref, _) => {
-            let id = cty_to_rs(ctx, &**t, allow_bool);
+            let id = cty_to_rs(ctx, &**t, allow_bool, use_full_path);
 /*
             if is_ref {
                 mk_refty(ctx, &id, is_const)
@@ -1602,7 +1699,7 @@ fn cty_to_rs(ctx: &mut GenCtx, ty: &Type, allow_bool: bool) -> ast::Ty {
 //            }
         },
         &TArray(ref t, s, _) => {
-            let ty = cty_to_rs(ctx, &**t, allow_bool);
+            let ty = cty_to_rs(ctx, &**t, allow_bool, use_full_path);
             mk_arrty(ctx, &ty, s)
         },
         &TFuncPtr(ref sig) => {
@@ -1614,21 +1711,46 @@ fn cty_to_rs(ctx: &mut GenCtx, ty: &Type, allow_bool: bool) -> ast::Ty {
             mk_fn_proto_ty(ctx, &decl, sig.abi)
         },
         &TNamed(ref ti) => {
-            let id = rust_type_id(ctx, ti.borrow().name.clone());
-            mk_ty(ctx, false, vec!(id))
+            let id = rust_type_id(ctx, &ti.borrow().name);
+
+            if use_full_path {
+                let mut path = ctx.full_path_for_module(ti.borrow().module_id);
+                path.push(id);
+                mk_ty(ctx, false, &path)
+            } else {
+                mk_ty(ctx, false, &[id])
+            }
         },
         &TComp(ref ci) => {
             let c = ci.borrow();
+            let id = comp_name(c.kind, &c.name);
+
             let args = c.args.iter().map(|gt| {
-                P(cty_to_rs(ctx, gt, allow_bool))
+                P(cty_to_rs(ctx, gt, allow_bool, false))
             }).collect();
-            mk_ty_args(ctx, false, vec!(comp_name(c.kind, &c.name)), args)
+
+            if use_full_path {
+                let mut path = ctx.full_path_for_module(c.module_id);
+                path.push(id);
+                mk_ty_args(ctx, false, &path, args)
+            } else {
+                mk_ty_args(ctx, false, &[id], args)
+            }
+
         },
         &TEnum(ref ei) => {
             let e = ei.borrow();
-            mk_ty(ctx, false, vec!(enum_name(&e.name)))
+            let id = enum_name(&e.name);
+
+            if use_full_path {
+                let mut path = ctx.full_path_for_module(e.module_id);
+                path.push(id);
+                mk_ty(ctx, false, &path)
+            } else {
+                mk_ty(ctx, false, &[id])
+            }
         }
-    };
+    }
 }
 
 fn cty_is_translatable(ty: &Type) -> bool {
@@ -1669,22 +1791,23 @@ fn cty_has_destructor(ty: &Type) -> bool {
     }
 }
 
-fn mk_ty(ctx: &GenCtx, global: bool, segments: Vec<String>) -> ast::Ty {
+fn mk_ty(ctx: &GenCtx, global: bool, segments: &[String]) -> ast::Ty {
     mk_ty_args(ctx, global, segments, vec!())
 }
 
-fn mk_ty_args(ctx: &GenCtx, global: bool, segments: Vec<String>, args: Vec<P<ast::Ty>>) -> ast::Ty {
+fn mk_ty_args(ctx: &GenCtx, global: bool, segments: &[String], args: Vec<P<ast::Ty>>) -> ast::Ty {
+    let segment_count = segments.len();
     let ty = ast::TyPath(
         None,
         ast::Path {
             span: ctx.span,
             global: global,
-            segments: segments.iter().map(|s| {
+            segments: segments.iter().enumerate().map(|(i, s)| {
                 ast::PathSegment {
                     identifier: ctx.ext_cx.ident_of(s),
                     parameters: ast::AngleBracketedParameters(ast::AngleBracketedParameterData {
                         lifetimes: vec!(),
-                        types: OwnedSlice::from_vec(args.clone()),
+                        types: OwnedSlice::from_vec(if i == segment_count - 1 { args.clone() } else { vec![] }),
                         bindings: OwnedSlice::empty(),
                     }),
                 }
@@ -1712,6 +1835,7 @@ fn mk_ptrty(ctx: &mut GenCtx, base: &ast::Ty, is_const: bool) -> ast::Ty {
     }
 }
 
+#[allow(dead_code)]
 fn mk_refty(ctx: &mut GenCtx, base: &ast::Ty, is_const: bool) -> ast::Ty {
     let ty = ast::TyRptr(
         None,

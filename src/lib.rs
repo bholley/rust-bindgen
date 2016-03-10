@@ -1,6 +1,6 @@
 #![crate_name = "bindgen"]
 #![crate_type = "dylib"]
-#![feature(convert, quote)]
+#![feature(quote)]
 
 extern crate syntex_syntax as syntax;
 extern crate libc;
@@ -20,7 +20,7 @@ use syntax::print::pprust;
 use syntax::print::pp::eof;
 use syntax::ptr::P;
 
-use types::Module;
+use types::ModuleMap;
 
 mod types;
 mod clangll;
@@ -152,11 +152,14 @@ impl Bindings {
 
         let span = span.unwrap_or(DUMMY_SP);
 
-        let root_module = try!(parse_headers(options, logger));
+        let module_map = try!(parse_headers(options, logger));
 
         let module = ast::Mod {
             inner: span,
-            items: gen::gen_mods(&options.links[..], root_module, span)
+            items: gen::gen_mods(&options.links[..],
+                                 module_map,
+                                 options.enable_cxx_namespaces,
+                                 span)
         };
 
         Ok(Bindings {
@@ -200,7 +203,7 @@ impl Logger for DummyLogger {
     fn warn(&self, _msg: &str) { }
 }
 
-fn parse_headers(options: &BindgenOptions, logger: &Logger) -> Result<Module, ()> {
+fn parse_headers(options: &BindgenOptions, logger: &Logger) -> Result<ModuleMap, ()> {
     fn str_to_ikind(s: &str) -> Option<types::IKind> {
         match s {
             "uchar"     => Some(types::IUChar),
